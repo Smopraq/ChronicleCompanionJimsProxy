@@ -1,0 +1,31 @@
+Chronicle Companion for Jim'sProxy 1.14.2 — Naming Cleanup
+
+Changed
+- Removed remaining WotLK/Wrath-era naming references from the active addon source and documentation.
+- Renamed account-wide SavedVariables:
+  ChronicleCompanionWoTLKDB -> ChronicleCompanionJimsProxyDB
+- Renamed per-character SavedVariables:
+  ChronicleCompanionWoTLKCharDB -> ChronicleCompanionJimsProxyCharDB
+- Updated ChronicleCompanionJimsProxy.toc to use the new SavedVariables names.
+- Updated Core/Config.lua to initialize and use the new SavedVariables globals.
+- Changed the WotLK-specific comment in Providers/RaidGroupProvider.lua to the neutral term "legacy fallback".
+- Removed the obsolete 3.3.5a reference from Providers/ResetProvider.lua.
+- Updated AGENTS.md so the documented project identity and compatibility rules no longer refer to WotLK.
+
+Files changed
+- AGENTS.md
+- ChronicleCompanionJimsProxy.toc
+- Core/Config.lua
+- Providers/RaidGroupProvider.lua
+- Providers/ResetProvider.lua
+
+Not changed
+- No raid/party-call behavior was modified.
+- No provider logic was otherwise changed.
+- No relay/protocol changes.
+- No UI functionality changes.
+- No PlayerListProvider.lua changes.
+- The GetNumRaidMembers() error seen in the older ChronicleCompanionWoTLK installation is not part of this source tree.
+
+Compatibility note
+- SavedVariables under the old ChronicleCompanionWoTLKDB and ChronicleCompanionWoTLKCharDB names are not migrated into the new Jim'sProxy-specific names.

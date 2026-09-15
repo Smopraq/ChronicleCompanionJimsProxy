@@ -1,0 +1,40 @@
+## Interface: 11402
+## Title: Chronicle Companion for Jim'sProxy 1.14.2
+## Notes: ChronicleClassic.com companion for Jim'sProxy and WoW Classic Era 1.14.2
+## Version: 0.8
+## DefaultState: enabled
+## Author: Emyrk
+## SavedVariables: ChronicleCompanionJimsProxyDB
+## SavedVariablesPerCharacter: ChronicleCompanionJimsProxyCharDB
+
+Core\Namespace.lua
+Core\Constants.lua
+Core\Logger.lua
+Core\Config.lua
+Core\Util.lua
+Core\CombatLogController.lua
+
+Capture\GearScan.lua
+Capture\TalentScan.lua
+Capture\CIFormat.lua
+Capture\LocalScan.lua
+
+Transport\Relay.lua
+
+Core\AutoLog.lua
+
+Providers\ZoneProvider.lua
+Providers\HeaderProvider.lua
+Providers\PlayerListProvider.lua
+Providers\LootProvider.lua
+
+Providers\ResetProvider.lua
+Providers\RaidGroupProvider.lua
+Providers\MetaProvider.lua
+
+UI\MinimapButton.lua
+UI\InspectUI.lua
+UI\SettingsUI.lua
+UI\RelayUI.lua
+
+Init.lua

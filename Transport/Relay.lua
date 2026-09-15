@@ -1,0 +1,743 @@
+-- =============================================================================
+-- Transport/Relay.lua
+--
+-- The hijack engine.  Overwrites SPELL_FAILED_* globals with our payload
+-- so the engine writes it into WoWCombatLog.txt on SPELL_CAST_FAILED.
+--
+-- The relay is message-type-agnostic.  It pulls data from registered
+-- providers in priority order.  Each provider implements:
+--
+--   provider.priority  number      lower = polled first
+--   provider:Poll()    string|nil  nil = nothing to send
+--   provider:Dirty()   number      0 = clean, >0 = pending message count
+--   provider:Label()   string      for UI / debug output
+--
+-- When the relay needs data it walks providers by priority until one
+-- returns a payload.  The payload is chunked on the fly and armed
+-- into the SPELL_FAILED_* globals.  On confirmed landing (CLEU match)
+-- we advance to the next chunk.  When the message is complete we poll
+-- again.
+--
+-- Short messages (< BIN_PACK_THRESHOLD) can bin-pack a second message
+-- from the next provider into the same slot.
+-- =============================================================================
+
+local Log = Chronicle.Logger
+local C   = Chronicle.C
+local CombatLog = Chronicle.CombatLogController
+
+Chronicle.Relay = {}
+local R = Chronicle.Relay
+
+-- ---------------------------------------------------------------------------
+-- Provider registry
+-- ---------------------------------------------------------------------------
+
+local providers = {}   -- sorted { {priority, provider}, ... }
+
+--- Register a provider with the relay.
+-- @tparam table provider must have .priority (number), :Poll(), :Dirty(), :Label()
+function R:RegisterProvider(provider)
+    if not provider or not provider.Poll or not provider.priority or not provider.Dirty then
+        Log:Warn("Relay: invalid provider (needs .priority, :Poll(), :Dirty(), :Label())")
+        return
+    end
+    -- Insert sorted by priority (lower first)
+    local entry = { priority = provider.priority, provider = provider }
+    local inserted = false
+    for i = 1, #providers do
+        if provider.priority < providers[i].priority then
+            table.insert(providers, i, entry)
+            inserted = true
+            break
+        end
+    end
+    if not inserted then
+        providers[#providers + 1] = entry
+    end
+    Log:Debug("Relay: registered provider '%s' (priority %d)",
+        tostring(provider:Label()), provider.priority)
+end
+
+function R:GetProviders()
+    return providers
+end
+
+-- ---------------------------------------------------------------------------
+-- Hijack state
+-- ---------------------------------------------------------------------------
+
+local originals     = {}      -- { [globalName] = originalValue }
+local captured      = false
+local globalsDirty  = false   -- true while globals hold our payload
+
+-- Active message being chunked
+local activePayload = nil     -- full payload string (from provider)
+local activeLabel   = ""      -- provider label for debug
+local activeCounter = 0       -- message counter digit (0-9)
+local chunkOffset   = 0       -- bytes of activePayload already landed
+local totalChunks   = 0       -- precomputed total chunk count
+local landedChunks  = 0       -- how many chunks have landed so far
+
+-- What is currently written into the globals
+local armedChunk    = nil
+
+-- Stashed next message (from bin-pack: payload was consumed but too big
+-- to fit entirely, so its first chunk was partially packed and the rest
+-- continues as the next message)
+local stashedPayload = nil
+local stashedLabel   = nil
+local stashedOffset  = 0    -- bytes already packed into the previous slot
+
+-- Relay on/off. Activation is delayed after LoggingCombat() turns on because
+-- CLEU can observe the first failure before the combat-log file writer persists
+-- it, which produces an orphan continuation at the start of the file.
+local active = false
+local activationPending = false
+local activationGeneration = 0
+
+
+-- Metrics (in-memory, reset on reload)
+local metrics = {
+    chunks_landed   = 0,
+    chunks_missed   = 0,
+    messages_sent   = 0,
+    provider_polls  = 0,
+    last_land_at    = 0,     -- time() of most recent landing
+    last_arm_at     = 0,     -- time() of most recent arm
+}
+
+-- ---------------------------------------------------------------------------
+-- Time-bucketed history (rolling 10 minutes, 1 bucket per minute)
+-- ---------------------------------------------------------------------------
+
+local BUCKET_COUNT = 10
+local BUCKET_SEC   = 60
+local buckets = {}
+local bucketStart = 0  -- time() when current bucket started
+
+local function initBuckets()
+    bucketStart = time()
+    for i = 1, BUCKET_COUNT do
+        buckets[i] = { landed = 0, missed = 0, errors = 0 }
+    end
+end
+initBuckets()
+
+-- Rotate buckets if needed, returns index of current bucket
+local function rotateBuckets()
+    local now = time()
+    local elapsed = now - bucketStart
+    if elapsed < BUCKET_SEC then return 1 end
+
+    local shifts = math.floor(elapsed / BUCKET_SEC)
+    if shifts >= BUCKET_COUNT then
+        -- Everything is stale, reset
+        initBuckets()
+        return 1
+    end
+
+    -- Shift buckets down (oldest falls off the end)
+    for s = 1, shifts do
+        -- Move everything down by 1
+        for i = BUCKET_COUNT, 2, -1 do
+            buckets[i] = buckets[i - 1]
+        end
+        buckets[1] = { landed = 0, missed = 0, errors = 0 }
+    end
+    bucketStart = bucketStart + shifts * BUCKET_SEC
+    return 1
+end
+
+local function recordBucket(field)
+    local idx = rotateBuckets()
+    buckets[idx][field] = buckets[idx][field] + 1
+end
+
+-- ---------------------------------------------------------------------------
+-- Event hook for UI live feed
+-- ---------------------------------------------------------------------------
+
+--- Optional callback the UI can set to receive real-time relay events.
+-- @tparam string eventType one of LANDED, MISSED, ARMED, POLL, ACTIVATED, DEACTIVATED
+-- @tparam string data context string
+R.onRelayEvent = nil
+
+local function fireEvent(eventType, data)
+    if R.onRelayEvent then
+        pcall(R.onRelayEvent, eventType, data or "")
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Public accessors
+-- ---------------------------------------------------------------------------
+
+--- @treturn table metrics counters
+function R:GetMetrics() return metrics end
+--- @treturn bool true while relay is waiting for the combat-log writer
+function R:IsActivationPending() return activationPending end
+--- @treturn bool true if relay is actively hijacking globals
+function R:IsActive() return active end
+
+--- @treturn string label of the provider whose message is currently being chunked
+function R:GetActiveLabel() return activeLabel end
+--- @treturn number landed chunks of active message
+--- @treturn number total chunks of active message
+function R:GetActiveProgress()
+    if not activePayload then return 0, 0 end
+    return landedChunks, totalChunks
+end
+--- @treturn string|nil the exact string currently written into SPELL_FAILED_* globals
+function R:GetArmedChunk() return armedChunk end
+
+--- Return a snapshot of all providers for the UI.
+-- @treturn table array of { label, priority, dirty, lastEmitAt }
+function R:GetProviderStates()
+    local result = {}
+    for i, entry in ipairs(providers) do
+        local p = entry.provider
+        local label = ""
+        local ok, lbl = pcall(p.Label, p)
+        if ok and lbl then label = lbl end
+
+        local dirtyCount = 0
+        local ok2, d = pcall(p.Dirty, p)
+        if ok2 and d then dirtyCount = d end
+
+        local lastEmit = 0
+        -- Providers can expose lastEmitAt via GetState() if they have it
+        if p.GetState then
+            local ok3, st = pcall(p.GetState, p)
+            if ok3 and st and st.lastEmitAt then
+                lastEmit = st.lastEmitAt
+            end
+        end
+
+        result[i] = {
+            label     = label,
+            priority  = entry.priority,
+            dirty     = dirtyCount,
+            lastEmitAt = lastEmit,
+        }
+    end
+    return result
+end
+
+--- Return the time-bucketed history for the UI.
+-- @treturn table array of { landed, missed, errors, minute_ago } (index 1 = current)
+function R:GetBuckets()
+    rotateBuckets()
+    local result = {}
+    for i = 1, BUCKET_COUNT do
+        result[i] = {
+            landed     = buckets[i].landed,
+            missed     = buckets[i].missed,
+            errors     = buckets[i].errors,
+            minute_ago = i - 1,
+        }
+    end
+    return result
+end
+
+-- ---------------------------------------------------------------------------
+-- Originals capture / restore
+-- ---------------------------------------------------------------------------
+
+local function captureOriginals()
+    if captured then return end
+    for _, name in ipairs(C.HIJACK_GLOBALS) do
+        originals[name] = _G[name]
+    end
+    captured = true
+    Log:Debug("Relay: captured %d originals", #C.HIJACK_GLOBALS)
+end
+
+local function restoreOriginals()
+    if not globalsDirty then return end
+    for _, name in ipairs(C.HIJACK_GLOBALS) do
+        _G[name] = originals[name]
+    end
+    globalsDirty = false
+    armedChunk = nil
+    Log:Debug("Relay: originals restored")
+end
+
+local function applyToGlobals(text)
+    for _, name in ipairs(C.HIJACK_GLOBALS) do
+        _G[name] = text
+    end
+    globalsDirty = true
+    armedChunk = text
+    metrics.last_arm_at = time()
+
+    -- Use activeLabel (summary) for the event, not raw payload
+    fireEvent("ARMED", string.format("%s (%d chars, chunk %d/%d)",
+        activeLabel, #(activePayload or ""), landedChunks + 1, totalChunks))
+end
+
+-- ---------------------------------------------------------------------------
+-- Chunking
+--
+-- Given a payload and a counter digit, produce the chunk at a given
+-- byte offset.  Framing:
+--   first chunk:  [N<payload_slice>       (243 chars max)
+--   middle chunk:   <payload_slice>       (245 chars max)
+--   last chunk:     <payload_slice>]      (244 chars max)
+--   single chunk: [N<payload_slice>]      (242 chars max)
+-- ---------------------------------------------------------------------------
+
+local FIELD_MAX = C.FIELD_MAX_CHARS  -- 245
+
+--- Compute total chunk count for a payload.
+local function computeChunkCount(payload)
+    local len = #payload
+    -- Single-slot: [N + payload + ] <= 245  ->  payload <= 242
+    if len <= FIELD_MAX - 3 then return 1 end
+
+    -- First chunk eats 243 of payload (245 - 2 for "[N")
+    local remaining = len - (FIELD_MAX - 2)
+    -- Continuation chunks have "~" prefix (1 char overhead)
+    -- Last chunk: ~ + payload + ] = 243 payload chars
+    -- Middle chunk: ~ + payload = 244 payload chars
+    if remaining <= FIELD_MAX - 2 then return 2 end  -- first + last
+    remaining = remaining - (FIELD_MAX - 2)  -- subtract last chunk capacity
+    local middles = math.ceil(remaining / (FIELD_MAX - 1))
+    return 1 + middles + 1  -- first + middles + last
+end
+
+--- Build chunk at the given offset for a payload + counter.
+-- Returns (chunkString, newOffset, isLast).
+--
+-- Chunk layout:
+--   first chunk:  [N<payload>       (prefix = 2 chars)
+--   middle chunk: ~<payload>        (prefix = 1 char)
+--   last chunk:   ~<payload>]       (prefix = 1 char, suffix = 1 char)
+--   single chunk: [N<payload>]      (prefix = 2 chars, suffix = 1 char)
+local function buildChunk(payload, counter, offset)
+    local len = #payload
+    local isFirst = (offset == 0)
+
+    -- Build prefix
+    local prefix
+    if isFirst then
+        prefix = C.MSG_OPEN .. tostring(counter)
+    else
+        prefix = C.MSG_CONTINUE
+    end
+
+    -- How much payload can we fit?
+    local capacity = FIELD_MAX - #prefix
+    local remaining = len - offset
+
+    -- Will this be the last chunk?
+    local suffix = ""
+    local isLast = false
+    if remaining <= capacity - 1 then
+        -- Fits with the closing bracket
+        suffix = C.MSG_CLOSE
+        isLast = true
+        capacity = capacity - 1
+    end
+
+    local slice = payload:sub(offset + 1, offset + capacity)
+    local newOffset = offset + #slice
+
+    return prefix .. slice .. suffix, newOffset, isLast
+end
+
+-- ---------------------------------------------------------------------------
+-- Provider polling
+-- ---------------------------------------------------------------------------
+
+--- Poll providers in priority order for a payload.
+-- Providers return (payload, summary) from Poll().
+-- summary is a short display string for the UI (e.g. "ZONE Dalaran").
+-- Returns (payload, summary) or (nil, nil).
+local function pollProviders()
+    metrics.provider_polls = metrics.provider_polls + 1
+    for _, entry in ipairs(providers) do
+        local ok, payload, summary = pcall(entry.provider.Poll, entry.provider)
+        if ok and payload and payload ~= "" then
+            if not summary or summary == "" then
+                -- Fallback: use label
+                local ok2, lbl = pcall(entry.provider.Label, entry.provider)
+                summary = (ok2 and lbl) or "?"
+            end
+            return payload, summary
+        elseif not ok then
+            Log:Warn("Relay: provider '%s' Poll() error: %s",
+                tostring(entry.provider:Label()), tostring(payload))
+        end
+    end
+    return nil, nil
+end
+
+--- Start a new message from a provider's payload.
+local function startMessage(payload, label)
+    activePayload = payload
+    activeLabel   = label
+    activeCounter = (activeCounter + 1) % (C.MSG_COUNTER_MAX + 1)
+    chunkOffset   = 0
+    totalChunks   = computeChunkCount(payload)
+    landedChunks  = 0
+    -- Logged via fireEvent("ARMED") instead
+end
+
+-- ---------------------------------------------------------------------------
+-- Arm the next chunk
+--
+-- Called after a landing or when we first activate.  Builds the next
+-- chunk and writes it to all SPELL_FAILED_* globals.
+--
+-- Bin-packing: if the current message fits entirely in one slot AND
+-- leaves room (< BIN_PACK_THRESHOLD), we try to pack a second message
+-- from the next provider into the same slot.
+-- ---------------------------------------------------------------------------
+
+local function armNext()
+    -- Need a message?
+    if not activePayload then
+        -- Check stash first (from bin-pack: first chunk already landed)
+        if stashedPayload then
+            local p, l, off = stashedPayload, stashedLabel, stashedOffset
+            stashedPayload = nil
+            stashedLabel   = nil
+            stashedOffset  = 0
+            startMessage(p, l)
+            -- Skip past the bytes already packed into the previous slot
+            if off > 0 then
+                chunkOffset = off
+            end
+        else
+            local payload, label = pollProviders()
+            if not payload then
+                -- Nothing to send -- restore originals
+                restoreOriginals()
+                return
+            end
+            startMessage(payload, label)
+        end
+    end
+
+    local chunk, newOffset, isLast = buildChunk(activePayload, activeCounter, chunkOffset)
+
+    -- Bin-packing: if this chunk completes its message AND there's room
+    -- left, fill the remaining space with the start of the next message.
+    -- This works for both short and long next-messages -- we just pack
+    -- as much of the first chunk as fits.
+    if isLast then
+        local remainingRoom = FIELD_MAX - #chunk
+        -- Keep packing while there's room for at least [N + 1 char
+        -- (a partial first chunk of a new message, no ] needed yet)
+        while remainingRoom >= 3 do
+            local payload2, label2 = pollProviders()
+            if not payload2 then break end
+
+            local framedLen = 2 + #payload2 + 1  -- [N + payload + ]  (if it fits entirely)
+            if framedLen <= remainingRoom then
+                -- Entire message fits! Pack it complete.
+                local counter2 = (activeCounter + 1) % (C.MSG_COUNTER_MAX + 1)
+                local packed = C.MSG_OPEN .. tostring(counter2) .. payload2 .. C.MSG_CLOSE
+                chunk = chunk .. packed
+                activeCounter = counter2
+                remainingRoom = remainingRoom - #packed
+                metrics.messages_sent = metrics.messages_sent + 1
+            else
+                -- Message too big to fit entirely.  Pack its first chunk
+                -- into the remaining space, stash the rest for continuation.
+                local counter2 = (activeCounter + 1) % (C.MSG_COUNTER_MAX + 1)
+                -- First chunk prefix: [N (2 chars).  No ] since it continues.
+                local prefix = C.MSG_OPEN .. tostring(counter2)
+                local sliceLen = remainingRoom - #prefix
+                if sliceLen >= 1 then
+                    local slice = payload2:sub(1, sliceLen)
+                    chunk = chunk .. prefix .. slice
+                    -- Stash remainder for continuation chunks
+                    stashedPayload = payload2
+                    stashedLabel   = label2
+                    stashedOffset  = sliceLen  -- how much we already packed
+                else
+                    -- Can't even fit 1 char -- stash the whole thing
+                    stashedPayload = payload2
+                    stashedLabel   = label2
+                    stashedOffset  = 0
+                end
+                break
+            end
+        end
+    end
+
+    applyToGlobals(chunk)
+
+    -- If this was the last chunk, prepare for completion on landing
+    if isLast then
+        -- We'll clear activePayload in onLanding() after confirmation
+        chunkOffset = newOffset  -- mark as "all bytes assigned"
+    else
+        chunkOffset = newOffset
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Landing + CLEU handler
+-- ---------------------------------------------------------------------------
+
+local function onLanding()
+    landedChunks = landedChunks + 1
+    metrics.chunks_landed = metrics.chunks_landed + 1
+    metrics.last_land_at = time()
+    recordBucket("landed")
+
+    fireEvent("LANDED", string.format("%s (chunk %d/%d)",
+        activeLabel, landedChunks, totalChunks))
+
+    -- Was that the last chunk of the active message?
+    if chunkOffset >= #(activePayload or "") then
+        metrics.messages_sent = metrics.messages_sent + 1
+        -- Logged via fireEvent("LANDED") instead
+        activePayload = nil
+        activeLabel   = ""
+    end
+
+    -- Arm the next chunk (or poll for a new message)
+    armNext()
+end
+
+local function onMiss(failedType)
+    metrics.chunks_missed = metrics.chunks_missed + 1
+    recordBucket("missed")
+    -- Re-arm the same chunk -- it stays in the globals already.
+    local preview = failedType or ""
+    if #preview > 50 then preview = preview:sub(1, 50) .. "..." end
+    fireEvent("MISSED", preview)
+end
+
+local function onSpellCastFailed(failedType)
+    if not active then return end
+
+    -- If nothing is armed, try to get something
+    if not armedChunk then
+        armNext()
+        return
+    end
+
+    -- Landing check: exact match
+    if failedType == armedChunk then
+        onLanding()
+    else
+        onMiss(failedType)
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- UIErrorsFrame suppression
+--
+-- When armed, the engine also routes SPELL_FAILED_* strings to the
+-- red error text overlay.  We hook AddMessage and drop anything that
+-- matches our current armed chunk.
+-- ---------------------------------------------------------------------------
+
+local uiErrorHooked = false
+local originalUIErrorAddMessage = nil
+
+local function installUIErrorHook()
+    if uiErrorHooked then return end
+    if not UIErrorsFrame then return end
+
+    originalUIErrorAddMessage = UIErrorsFrame.AddMessage
+    UIErrorsFrame.AddMessage = function(self, msg, ...)
+        -- Drop messages that are our armed payload
+        if armedChunk and msg == armedChunk then
+            return
+        end
+        -- Also drop anything that starts with our framing markers:
+        --   [N  (message start + digit)
+        --   ~   (continuation chunk)
+        if msg and #msg >= 2 then
+            local first = msg:sub(1, 1)
+            if first == C.MSG_CONTINUE then
+                return
+            end
+            local second = msg:sub(2, 2)
+            if first == C.MSG_OPEN and second >= "0" and second <= "9" then
+                return
+            end
+        end
+        return originalUIErrorAddMessage(self, msg, ...)
+    end
+    uiErrorHooked = true
+end
+
+-- ---------------------------------------------------------------------------
+-- Taint error suppression
+--
+-- Overwriting SPELL_FAILED_* globals causes taint.  We suppress the
+-- cosmetic error popups.  The actual taint is harmless for our use case.
+-- ---------------------------------------------------------------------------
+
+local taintHooked = false
+
+local function installTaintSuppression()
+    if taintHooked then return end
+
+    -- Layer 1: error handler wrapper
+    local innerHandler = geterrorhandler()
+    seterrorhandler(function(msg)
+        if type(msg) == "string"
+            and msg:find("ChronicleCompanionJimsProxy", 1, true)
+            and msg:find("tainted", 1, true)
+        then
+            return  -- swallow
+        end
+        if innerHandler then return innerHandler(msg) end
+    end)
+
+    -- Layer 2: StaticPopup suppression
+    local popupNames = { "ADDON_ACTION_FORBIDDEN", "ADDON_ACTION_BLOCKED" }
+    for _, name in ipairs(popupNames) do
+        local dialog = StaticPopupDialogs and StaticPopupDialogs[name]
+        if dialog then
+            local origOnShow = dialog.OnShow
+            dialog.OnShow = function(self, ...)
+                -- If the popup text mentions our addon, hide it
+                local text = self.text and self.text:GetText() or ""
+                if text:find("ChronicleCompanionJimsProxy", 1, true) then
+                    self:Hide()
+                    return
+                end
+                if origOnShow then return origOnShow(self, ...) end
+            end
+        end
+    end
+
+    taintHooked = true
+end
+
+-- ---------------------------------------------------------------------------
+-- Activation / deactivation
+-- ---------------------------------------------------------------------------
+
+local function shouldBeActive()
+    return CombatLog:GetState() == true
+end
+
+local function activateNow()
+    if active or not shouldBeActive() then return end
+
+    activationPending = false
+    captureOriginals()
+    installUIErrorHook()
+    installTaintSuppression()
+
+    -- A header can be lost at a combat-log startup boundary even when CLEU
+    -- confirms the carrier. Make every real activation start with fresh session
+    -- context before lower-priority provider data.
+    if Chronicle.HeaderProvider then
+        Chronicle.HeaderProvider:MarkDirty()
+    end
+
+    active = true
+    Log:Debug("Relay: activated after %ds startup delay", C.RELAY_ACTIVATION_DELAY_SEC)
+    fireEvent("ACTIVATED", "")
+    armNext()
+end
+
+function R:Activate()
+    if active or activationPending or not shouldBeActive() then return end
+
+    activationGeneration = activationGeneration + 1
+    local generation = activationGeneration
+    activationPending = true
+    Log:Debug("Relay: waiting %ds for combat-log writer", C.RELAY_ACTIVATION_DELAY_SEC)
+
+    Chronicle.RunAfter(C.RELAY_ACTIVATION_DELAY_SEC, function()
+        if generation ~= activationGeneration then return end
+        activationPending = false
+        activateNow()
+    end)
+end
+
+function R:Deactivate()
+    activationGeneration = activationGeneration + 1
+    activationPending = false
+    if not active then return end
+
+    restoreOriginals()
+    active = false
+    activePayload = nil
+    activeLabel   = ""
+    Log:Debug("Relay: deactivated")
+    fireEvent("DEACTIVATED", "")
+end
+
+--- Kick the relay -- called by providers when they become dirty.
+-- If the relay is active and idle (nothing armed), polls providers
+-- and arms the first available chunk immediately.
+function R:Kick()
+    if not active then return end
+    if armedChunk then return end  -- already working on something
+    armNext()
+end
+
+function R:Reevaluate()
+    if shouldBeActive() then
+        if not active and not activationPending then
+            R:Activate()
+        end
+    elseif active or activationPending then
+        R:Deactivate()
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Event wiring
+-- ---------------------------------------------------------------------------
+
+local function onCLEU()
+    -- Never count a carrier while file logging is disabled.
+    if CombatLog:GetState() ~= true then
+        if active or activationPending then R:Deactivate() end
+        return
+    elseif not active then
+        R:Reevaluate()
+        return
+    end
+
+    local _timestamp, subevent, _hideCaster,
+        _sourceGUID, _sourceName, _sourceFlags, _sourceRaidFlags,
+        _destGUID, _destName, _destFlags, _destRaidFlags,
+        _spellId, _spellName, _spellSchool, failedType =
+        CombatLogGetCurrentEventInfo()
+    if subevent ~= "SPELL_CAST_FAILED" then return end
+    -- All players' failures carry our hijacked globals on this client.
+    -- Accept any source to maximize landing throughput in raids.
+    if failedType then
+        onSpellCastFailed(failedType)
+    end
+end
+
+local function onPlayerLogin()
+    captureOriginals()
+    -- Start relay if combat logging is already on
+    R:Reevaluate()
+end
+
+local function onPlayerLogout()
+    -- Unconditional safety net -- always restore
+    if captured then
+        for _, name in ipairs(C.HIJACK_GLOBALS) do
+            _G[name] = originals[name]
+        end
+    end
+end
+
+-- Reevaluate on events that might change shouldBeActive()
+Chronicle.RegisterEvent("PLAYER_LOGIN", onPlayerLogin)
+Chronicle.RegisterEvent("PLAYER_LOGOUT", onPlayerLogout)
+Chronicle.RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED", onCLEU)
+
+-- These could change LoggingCombat() state
+Chronicle.RegisterEvent("PLAYER_ENTERING_WORLD", function()
+    R:Reevaluate()
+end)

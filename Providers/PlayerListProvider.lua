@@ -1,0 +1,563 @@
+-- =============================================================================
+-- Providers/PlayerListProvider.lua
+--
+-- Tracks party/raid members and emits per-player CI segments through the
+-- relay. Each player has independent segment tracking with per-segment
+-- priority, cooldown, and dirty state.
+--
+-- Poll() snapshots the data at call time and returns ONE segment for ONE
+-- player -- the most urgent segment for the most urgent player.
+--
+-- Priority 4 (after Reset, Zone, and Header).
+-- =============================================================================
+
+local C       = Chronicle.C
+local Log     = Chronicle.Logger
+local Relay   = Chronicle.Relay
+local Capture = Chronicle.Capture
+local Format  = Chronicle.CIFormat
+local Util    = Chronicle.Util
+
+local P = {
+    priority = 4,
+}
+
+-- ---------------------------------------------------------------------------
+-- Segment definitions: key, priority, cooldown, formatter, self-only flag
+-- Lower priority number = emitted first within a player.
+-- ---------------------------------------------------------------------------
+
+local SEGMENT_DEFS = {
+    { key = "I", priority = 1, cooldown = 1800, selfOnly = false  },  -- Identity, 30 min
+    { key = "G", priority = 2, cooldown = 1800,  selfOnly = false }, -- Gear, 30 min
+    { key = "T", priority = 3, cooldown = 300,  selfOnly = true   },  -- Talents, 5 min
+    { key = "U", priority = 5, cooldown = 3600, selfOnly = false  },  -- Guild, 1 hr
+    { key = "E", priority = 6, cooldown = 600,  selfOnly = false  },  -- Pet, 10 min
+    { key = "H", priority = 7, cooldown = 7200, selfOnly = true   },  -- Honor, 60 min
+}
+
+-- Lookup for fast access
+local SEG_BY_KEY = {}
+for _, def in ipairs(SEGMENT_DEFS) do
+    SEG_BY_KEY[def.key] = def
+end
+
+-- ---------------------------------------------------------------------------
+-- Player state
+-- ---------------------------------------------------------------------------
+
+local players = {}       -- guid -> player state table
+local selfGuid = nil     -- cached UnitGUID("player")
+
+--- Create a fresh player entry.
+-- @tparam string guid player GUID
+-- @tparam string unit unit token ("player", "raid5", etc.)
+-- @tparam boolean isSelf true for the local player
+-- @treturn table player state
+local function newPlayer(guid, unit, isSelf)
+    local entry = {
+        guid   = guid,
+        unit   = unit,
+        isSelf = isSelf,
+        segs   = {},
+    }
+    for _, def in ipairs(SEGMENT_DEFS) do
+        -- Peers don't get self-only segments
+        if not def.selfOnly or isSelf then
+            entry.segs[def.key] = {
+                dirty      = true,
+                lastEmitAt = 0,
+                cooldown   = def.cooldown,
+            }
+        end
+    end
+    return entry
+end
+
+-- ---------------------------------------------------------------------------
+-- Segment dirty helpers
+-- ---------------------------------------------------------------------------
+
+--- Check if a segment is due for emit (dirty or past cooldown).
+local function segmentIsDue(seg)
+    if not seg then return false end
+    if seg.dirty then return true end
+    if (time() - seg.lastEmitAt) >= seg.cooldown then return true end
+    return false
+end
+
+--- Mark a specific segment dirty for a player.
+-- @tparam string guid player GUID
+-- @tparam string key segment key (I, G, T, etc.)
+-- @tparam string reason why this segment is being marked dirty
+local function markSegDirty(guid, key, reason)
+    local pl = players[guid]
+    if not pl then return end
+    local seg = pl.segs[key]
+    if seg and not seg.dirty then
+        seg.dirty = true
+        local name = (pl.unit and UnitName(pl.unit)) or guid
+        Log:Debug("PlayerList: %s.%s dirty (%s)", name, key, reason or "?")
+    end
+end
+
+--- Mark a specific segment dirty for ALL tracked players.
+local function markAllSegDirty(key)
+    for _, pl in pairs(players) do
+        local seg = pl.segs[key]
+        if seg then seg.dirty = true end
+    end
+end
+
+--- Mark all segments dirty for a single player.
+-- @tparam string guid player GUID
+-- @tparam string reason why all segments are being dirtied
+local function markPlayerAllDirty(guid, reason)
+    local pl = players[guid]
+    if not pl then return end
+    for key, seg in pairs(pl.segs) do
+        if not seg.dirty then
+            seg.dirty = true
+        end
+    end
+    local name = (pl.unit and UnitName(pl.unit)) or guid
+    Log:Debug("PlayerList: %s ALL dirty (%s)", name, reason or "?")
+end
+
+-- ---------------------------------------------------------------------------
+-- Inspect management for peers
+--
+-- Before we can read a peer's gear we need NotifyInspect().
+-- We track which peers have been inspected recently and throttle requests.
+-- ---------------------------------------------------------------------------
+
+local lastInspectAt   = 0       -- time() of last NotifyInspect call
+local lastInspectGuid = nil     -- GUID of the peer we last called NotifyInspect on
+local INSPECT_THROTTLE = 1.5    -- seconds between inspect requests
+local inspectedGuids  = {}      -- guid -> time() of last successful inspect
+local INSPECT_CACHE_SEC = 120   -- consider inspect data fresh for 2 min
+
+-- ---------------------------------------------------------------------------
+-- Segment formatters: capture + format at Poll time
+--
+-- Each returns a formatted segment string or nil.
+-- For peers, we read from the inspect buffer (must be populated).
+-- ---------------------------------------------------------------------------
+
+local function formatSegment(pl, key)
+    local unit = pl.unit
+    local isSelf = pl.isSelf
+
+    if key == "I" then
+        -- Identity: lightweight, always available for visible units
+        local name  = UnitName(unit) or ""
+        local class = select(2, UnitClass(unit)) or ""
+        local race  = select(2, UnitRace(unit)) or ""
+        local sex   = UnitSex(unit) or 0
+        local level = UnitLevel(unit) or 0
+
+        -- If core fields are missing the unit is still loading / phased.
+        -- Return nil + retry flag so Poll() schedules a fast re-check
+        -- instead of emitting an empty identity for 30 minutes.
+        if name == "" or class == "" then
+            return nil, true   -- retry flag
+        end
+
+        local ci = { player = {
+            name   = name,
+            class  = class,
+            race   = race,
+            gender = sex,
+            level  = level,
+        }}
+        return Format.Identity(ci)
+
+    elseif key == "G" then
+        local gear = Capture.ScanGear(unit)
+        return Format.Gear(gear)
+
+    elseif key == "T" then
+        if not isSelf then return nil end
+        local talents = Capture.ScanTalents(unit, false)
+        return Format.Talents(talents)
+
+    elseif key == "U" then
+        local guild = Capture.ScanGuild(unit)
+        return Format.Guild(guild)
+
+    elseif key == "E" then
+        local pet = Capture.ScanPet(unit)
+        return Format.Pet(pet)
+
+    elseif key == "H" then
+        if not isSelf then return nil end
+        local honor = Capture.ScanHonor()
+        return Format.Honor(honor)
+
+    end
+
+    return nil
+end
+
+--- Check if we can read a peer's inspect buffer (gear).
+-- @tparam table pl player entry
+-- @treturn boolean true if inspect data is available or not needed
+local function hasInspectData(pl)
+    if pl.isSelf then return true end
+    local lastInsp = inspectedGuids[pl.guid]
+    if lastInsp and (time() - lastInsp) < INSPECT_CACHE_SEC then
+        return true
+    end
+    return false
+end
+
+--- Check if a peer is in range and inspectable.
+-- @tparam table pl player entry
+-- @treturn boolean
+local function canInspectPeer(pl)
+    if pl.isSelf then return true end
+    local unit = pl.unit
+    if not unit then return false end
+    if not UnitExists(unit) then return false end
+    if not UnitIsVisible(unit) then return false end
+    if not UnitIsConnected(unit) then return false end
+    if type(CanInspect) == "function" and not CanInspect(unit) then return false end
+    if type(CheckInteractDistance) == "function" and not CheckInteractDistance(unit, 1) then
+        return false
+    end
+    return true
+end
+
+--- Try to fire NotifyInspect for a peer if throttle allows.
+-- @tparam table pl player entry
+-- @treturn boolean true if inspect was fired (data will arrive async)
+local function tryInspect(pl)
+    if pl.isSelf then return false end
+    local now = GetTime()
+    if (now - lastInspectAt) < INSPECT_THROTTLE then return false end
+    if not canInspectPeer(pl) then return false end
+
+    lastInspectAt = now
+    lastInspectGuid = pl.guid
+    NotifyInspect(pl.unit)
+    Log:Debug("PlayerList: inspecting %s (%s)", UnitName(pl.unit) or "?", pl.unit)
+    return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Provider interface
+-- ---------------------------------------------------------------------------
+
+--- @treturn string provider label
+function P:Label()
+    return "PlayerList"
+end
+
+--- Return count of dirty segments across reachable players only.
+-- Out-of-range peers are excluded since we can't serve them anyway.
+-- @treturn number dirty segment count
+function P:Dirty()
+    local count = 0
+    for _, pl in pairs(players) do
+        -- Skip unreachable peers
+        if pl.isSelf or canInspectPeer(pl) then
+            for _, seg in pairs(pl.segs) do
+                if segmentIsDue(seg) then
+                    count = count + 1
+                end
+            end
+        end
+    end
+    return count
+end
+
+--- Poll for the next segment to emit.
+-- Walks players (self first, then peers sorted by oldest emit),
+-- then walks segments by priority within each player.
+-- Snapshots the data at call time.
+-- @treturn string|nil formatted wire message, or nil if nothing to send
+function P:Poll()
+    if not selfGuid then return nil end
+
+    -- Build ordered player list: self first, then peers
+    local ordered = {}
+    local selfEntry = players[selfGuid]
+    if selfEntry then
+        ordered[1] = selfEntry
+    end
+    -- Collect peers sorted by priority:
+    --   1. Just-inspected peers (fresh data waiting to be emitted)
+    --   2. Then by oldest segment emit (most stale first)
+    local peers = {}
+    local now = time()
+    for guid, pl in pairs(players) do
+        if guid ~= selfGuid then
+            peers[#peers + 1] = pl
+        end
+    end
+    table.sort(peers, function(a, b)
+        -- Just-inspected peers go first (fresh data within last 5 seconds)
+        local aFresh = inspectedGuids[a.guid] and (now - inspectedGuids[a.guid]) < 5
+        local bFresh = inspectedGuids[b.guid] and (now - inspectedGuids[b.guid]) < 5
+        if aFresh ~= bFresh then return aFresh end
+
+        -- Otherwise sort by oldest segment emit (most stale first)
+        local aOldest, bOldest = now, now
+        for _, seg in pairs(a.segs) do
+            if seg.lastEmitAt < aOldest then aOldest = seg.lastEmitAt end
+        end
+        for _, seg in pairs(b.segs) do
+            if seg.lastEmitAt < bOldest then bOldest = seg.lastEmitAt end
+        end
+        return aOldest < bOldest
+    end)
+    for _, pl in ipairs(peers) do
+        ordered[#ordered + 1] = pl
+    end
+
+    -- Walk players, then segments by priority
+    for _, pl in ipairs(ordered) do
+        -- For peers, check if they're in range
+        if not pl.isSelf and not canInspectPeer(pl) then
+            -- Skip this peer entirely -- too far away
+        else
+            for _, def in ipairs(SEGMENT_DEFS) do
+                local seg = pl.segs[def.key]
+                if seg and segmentIsDue(seg) then
+                    -- Log why this segment is due
+                    if not seg.dirty and seg.lastEmitAt > 0 then
+                        local name = UnitName(pl.unit) or pl.guid
+                        Log:Debug("PlayerList: %s.%s due (cooldown expired, age=%ds, cd=%ds)",
+                            name, def.key, time() - seg.lastEmitAt, seg.cooldown)
+                    end
+                    -- For peers: gear needs fresh inspect data.
+                    -- require fresh inspect buffer
+                    local needsInspect = (not pl.isSelf) and def.key == "G"
+                    if needsInspect and not hasInspectData(pl) then
+                        -- Try to fire inspect, skip this segment for now
+                        tryInspect(pl)
+                    else
+                        -- Snapshot + format
+                        local segment, retry = formatSegment(pl, def.key)
+                        if retry then
+                            -- Unit info unavailable (loading/phased).
+                            -- Schedule a fast re-check instead of waiting
+                            -- the full cooldown.  Keep seg.dirty true and
+                            -- nudge lastEmitAt so segmentIsDue() fires
+                            -- again after IDENTITY_RETRY_SEC.
+                            seg.lastEmitAt = time() - seg.cooldown + C.IDENTITY_RETRY_SEC
+                            Log:Debug("PlayerList: %s.%s retry in %ds (unit not ready)",
+                                UnitName(pl.unit) or pl.guid, def.key, C.IDENTITY_RETRY_SEC)
+                            -- fall through to next segment / player
+                        elseif not segment then
+                            -- Nothing to emit (for example, no active pet).
+                            -- Mark clean so we don't keep retrying every Poll.
+                            seg.dirty = false
+                            seg.lastEmitAt = time()
+                        else
+                            seg.dirty = false
+                            seg.lastEmitAt = time()
+                            local msg = Format.Wrap(pl.guid, segment)
+                            local name = UnitName(pl.unit) or pl.guid
+                            local summary = string.format("CI %s:%s", name, def.key)
+                            return msg, summary
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+--- Return current state for UI/debug.
+-- @treturn table { players = { guid -> { unit, isSelf, segs } }, selfGuid }
+function P:GetState()
+    return {
+        players  = players,
+        selfGuid = selfGuid,
+    }
+end
+
+-- ---------------------------------------------------------------------------
+-- Roster management
+-- ---------------------------------------------------------------------------
+
+--- Refresh the tracked player list from the current party/raid roster.
+-- @treturn table list of newly-added GUIDs (already fully dirty via newPlayer)
+-- @treturn table list of removed GUIDs (no longer tracked)
+local function refreshRoster()
+    selfGuid = UnitGUID("player")
+    if not selfGuid then return {}, {} end
+
+    local seen = {}
+    local added, removed = {}, {}
+
+    -- Always track self
+    if not players[selfGuid] then
+        players[selfGuid] = newPlayer(selfGuid, "player", true)
+        added[#added + 1] = selfGuid
+        Log:Debug("PlayerList: tracking self %s", selfGuid)
+    else
+        players[selfGuid].unit = "player"
+    end
+    seen[selfGuid] = true
+
+    if IsInRaid() then
+        -- Raid members
+        local numRaid = GetNumGroupMembers() or 0
+        for i = 1, numRaid do
+            local unit = "raid" .. i
+            local guid = UnitGUID(unit)
+            if guid and guid ~= selfGuid then
+                seen[guid] = true
+                if not players[guid] then
+                    players[guid] = newPlayer(guid, unit, false)
+                    added[#added + 1] = guid
+                    Log:Debug("PlayerList: tracking %s (%s)", UnitName(unit) or "?", unit)
+                else
+                    players[guid].unit = unit
+                end
+            end
+        end
+    else
+        -- Party members (excluding the player)
+        local numParty = GetNumSubgroupMembers() or 0
+        for i = 1, numParty do
+            local unit = "party" .. i
+            local guid = UnitGUID(unit)
+            if guid and guid ~= selfGuid then
+                seen[guid] = true
+                if not players[guid] then
+                    players[guid] = newPlayer(guid, unit, false)
+                    added[#added + 1] = guid
+                    Log:Debug("PlayerList: tracking %s (%s)", UnitName(unit) or "?", unit)
+                else
+                    players[guid].unit = unit
+                end
+            end
+        end
+    end
+
+    -- Remove players no longer in roster
+    for guid in pairs(players) do
+        if not seen[guid] then
+            Log:Debug("PlayerList: removing %s (left group)", guid)
+            players[guid] = nil
+            removed[#removed + 1] = guid
+        end
+    end
+
+    return added, removed
+end
+
+-- ---------------------------------------------------------------------------
+-- Event wiring
+-- ---------------------------------------------------------------------------
+
+-- Self gear changed
+Chronicle.RegisterEvent("UNIT_INVENTORY_CHANGED", function(event, unit)
+    if unit == "player" and selfGuid then
+        markSegDirty(selfGuid, "G", "UNIT_INVENTORY_CHANGED")
+        Relay:Kick()
+        return
+    end
+    -- Peer gear changed: invalidate their inspect cache so we re-inspect
+    local guid = UnitGUID(unit)
+    if guid and players[guid] and not players[guid].isSelf then
+        inspectedGuids[guid] = nil  -- wipe cache, forces re-inspect on next Poll
+        markSegDirty(guid, "G", "UNIT_INVENTORY_CHANGED (peer)")
+        Relay:Kick()
+    end
+end)
+
+-- Self gear changes, including ring and trinket slots.
+Chronicle.RegisterEvent("PLAYER_EQUIPMENT_CHANGED", function()
+    if selfGuid then
+        markSegDirty(selfGuid, "G", "PLAYER_EQUIPMENT_CHANGED")
+        Relay:Kick()
+    end
+end)
+
+-- Classic Era uses CHARACTER_POINTS_CHANGED for local talent changes.
+Chronicle.RegisterEvent("CHARACTER_POINTS_CHANGED", function()
+    if selfGuid then
+        markSegDirty(selfGuid, "T", "CHARACTER_POINTS_CHANGED")
+        Relay:Kick()
+    end
+end)
+
+-- Peer inspection completed. Only the currently requested GUID is accepted.
+Chronicle.RegisterEvent("INSPECT_READY", function(event, guid)
+    if not guid or guid ~= lastInspectGuid then return end
+
+    local pl = players[guid]
+    lastInspectGuid = nil
+    if not pl or pl.isSelf or not pl.unit or UnitGUID(pl.unit) ~= guid then return end
+
+    inspectedGuids[guid] = time()
+    markSegDirty(guid, "G", "INSPECT_READY")
+    Relay:Kick()
+end)
+
+-- Pet changed
+Chronicle.RegisterEvent("UNIT_PET", function(event, unit)
+    local guid = unit and UnitGUID(unit)
+    if guid and players[guid] then
+        markSegDirty(guid, "E", "UNIT_PET")
+        Relay:Kick()
+    end
+end)
+
+-- Unit name/info became available (loading finished, came into range, etc.)
+Chronicle.RegisterEvent("UNIT_NAME_UPDATE", function(event, unit)
+    local guid = UnitGUID(unit)
+    if not guid then return end
+    local pl = players[guid]
+    if not pl then return end
+    markSegDirty(guid, "I", "UNIT_NAME_UPDATE")
+    Relay:Kick()
+end)
+
+-- Guild changed
+Chronicle.RegisterEvent("PLAYER_GUILD_UPDATE", function()
+    if selfGuid then
+        markSegDirty(selfGuid, "U", "PLAYER_GUILD_UPDATE")
+        Relay:Kick()
+    end
+end)
+
+-- Roster changed: refresh the tracked list and only react to real composition
+-- changes. Newly-added players are already
+-- fully dirty via newPlayer(); existing players keep their segment state and
+-- rely on per-segment cooldowns for periodic refresh.
+local function onRosterChanged()
+    Chronicle.RunNextFrame(function()
+        local added, removed = refreshRoster()
+        if (added and #added > 0) or (removed and #removed > 0) then
+            Log:Debug("PlayerList: roster delta +%d -%d", #added, #removed)
+            Relay:Kick()
+        end
+    end)
+end
+Chronicle.RegisterEvent("GROUP_ROSTER_UPDATE", onRosterChanged)
+
+-- Login: initialize
+Chronicle.RegisterEvent("PLAYER_LOGIN", function()
+    selfGuid = UnitGUID("player")
+    refreshRoster()
+end)
+
+-- Entering world (zone transitions, reloads)
+Chronicle.RegisterEvent("PLAYER_ENTERING_WORLD", function()
+    selfGuid = UnitGUID("player")
+    refreshRoster()
+end)
+
+-- ---------------------------------------------------------------------------
+-- Register with Relay
+-- ---------------------------------------------------------------------------
+
+Relay:RegisterProvider(P)
+Chronicle.PlayerListProvider = P
