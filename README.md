@@ -33,7 +33,9 @@ Pull requests are welcome. For major changes, please open an issue first to disc
 
 [MIT](LICENSE)
 
-## Author
+1.14.2 Companion Port done by Smopraq.
+
+## Original Author
 
 **Emyrk** · Creator of [ChronicleClassic.com](https://chronicleclassic.com)
 
