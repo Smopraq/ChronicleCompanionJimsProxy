@@ -14,16 +14,16 @@ The Chronicle companion addon for **[ChronicleClassic.com](https://chronicleclas
 
 Upload your logs at **[chronicleclassic.com](https://chronicleclassic.com)**.
 
-## Features
-
-- _Coming soon_ — this addon is under active development.
-
 ## Installation
 
 1. Download the latest release
 2. Extract to your `Interface/AddOns/` folder
 3. Ensure the folder is named `ChronicleCompanionJimsProxy`
 4. Restart WoW
+
+## Realm/client info
+
+Coded for the [KronosV vanilla server]([url](https://www.kronos-wow.com/)) hosted by [Twinstar](https://twinstar-wow.com/) altho this addon should work for anyone playing a 1.12.1 server ran via hermes or jimprox, playing with a 1.14.2 client.
 
 ## Contributing
 
