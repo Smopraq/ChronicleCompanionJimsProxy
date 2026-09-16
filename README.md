@@ -23,7 +23,7 @@ Upload your logs at **[chronicleclassic.com](https://chronicleclassic.com)**.
 
 ## Realm/client info
 
-Coded for the [KronosV vanilla server](https://www.kronos-wow.com/) hosted by [Twinstar](https://twinstar-wow.com/) altho this addon should work for anyone playing a 1.12.1 server ran via hermes or jimprox, playing with a 1.14.2 client.
+Coded for the [KronosV vanilla server](https://www.kronos-wow.com/) hosted by [Twinstar](https://twinstar-wow.com/) altho this addon should work for anyone playing a 1.12.1 server on a 1.14.2 client via a hermes proxy solution.
 
 ## Contributing
 
