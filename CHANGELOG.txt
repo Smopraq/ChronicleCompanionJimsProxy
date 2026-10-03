@@ -1,4 +1,111 @@
-Chronicle Companion for Jim'sProxy 1.14.2 — Naming Cleanup
+╔══════════════════════════════════════════════════════════════════════════╗
+║                                                                          ║
+║          CHRONICLE COMPANION FOR JIM'SPROXY 1.14.2  ::  CHANGELOG        ║
+║                                                                          ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+
+============================================================================
+ VERSION 0.8.1  ::  2026-10-03  ::  LOG PARSING FIXES
+============================================================================
+
+    Logs recorded with 0.8.0 could stop parsing on ChronicleClassic.com
+    partway through a session, lost player data, and never delivered the
+    raid group layout. All three causes are fixed here and verified
+    against Chronicle's own HermesProxy parser (Emyrk/chronicle fa0f9aa).
+
+
+FIXES
+-----
+
+  FIX 01 :: Relay no longer splits a GUID across two chunks
+
+    The relay cut payloads at fixed byte positions, so a GUID such as
+    Player-1-00004AAF could end up half in one SPELL_CAST_FAILED line and
+    half in the next. Chronicle rewrites these GUIDs line by line before
+    it joins the chunks, so a half GUID either aborted the whole parse
+    (everything after that line was lost) or silently dropped that
+    player's segment. Chunk cuts now move back to just before the GUID.
+
+    Seen in the field :: "ubrs - log stops after first boss" stopped at
+    21:56:50 on the split "[2PPlayer-1-" | "~00004AAF;T1,...". 15 of 30
+    recorded 0.8.0 logs stop parsing partway for this reason.
+
+  FIX 02 :: Raid group layout (RG) uses compact hex GUIDs on 1.14.2
+
+    compactGuid() only understood the old 0x... GUID form, so 1.14.2
+    Player-<server>-<id> GUIDs were sent unchanged and Chronicle rejected
+    every RG message. They are now written as the hex text of
+    (server << 32) | id, as SPEC.md already described:
+
+        Player-1-00004AAF   ->   100004AAF
+
+  FIX 03 :: Own gear is no longer re-sent on every inventory event
+
+    UNIT_INVENTORY_CHANGED marked the gear segment dirty even when no
+    equipped item changed, so the 2-3 chunk gear message was re-sent
+    every 20-60 s and delayed other players' data. Self gear is now only
+    re-sent when the scanned gear differs from the last sent gear, or
+    when its 30 minute cooldown expires.
+
+
+FILES CHANGED
+-------------
+
+  ┌──────────────────────────────────┬─────────────────────────────────────┐
+  │ FILE                             │ CHANGE                              │
+  ├──────────────────────────────────┼─────────────────────────────────────┤
+  │ Transport/Relay.lua              │ guidSafeCut(); exact chunk count    │
+  │ Providers/RaidGroupProvider.lua  │ compactGuid() handles Player-...    │
+  │ Providers/PlayerListProvider.lua │ selfGearChanged() gate on events    │
+  │ ChronicleCompanionJimsProxy.toc  │ Version 0.8 -> 0.8.1                │
+  │ SPEC.md                          │ GUID-safe chunks, RG GUID mapping   │
+  │ CHANGELOG.txt                    │ this entry                          │
+  └──────────────────────────────────┴─────────────────────────────────────┘
+
+
+VERIFICATION
+------------
+
+    Run outside the game: the addon's real Relay, RaidGroupProvider and
+    PlayerListProvider code under LuaJIT with stubbed WoW APIs, fed with
+    288 real payloads from four recorded logs (30 alignment-shifted
+    passes, 8670 messages). The generated combat log was then parsed by
+    Chronicle's real Go parser.
+
+  ┌──────────────────────────────┬──────────────────┬──────────────────┐
+  │ RESULT                       │ 0.8.0            │ 0.8.1            │
+  ├──────────────────────────────┼──────────────────┼──────────────────┤
+  │ Parse reaches end of log     │ no (4 messages)  │ yes              │
+  │ Player records (Combatant)   │ 4                │ 4290 of 4290     │
+  │ Raid group layouts           │ 0                │ 240 of 240       │
+  │ Pet owners                   │ 0                │ 390 of 390       │
+  │ Parser warnings / errors     │ stuck            │ 0 / 0            │
+  │ Gear re-sent, gear unchanged │ every event      │ never            │
+  └──────────────────────────────┴──────────────────┴──────────────────┘
+
+    Not yet verified in game :: needs one logged session with 0.8.1.
+
+
+NOT CHANGED
+-----------
+
+    Wire format of all messages except RG GUID text (now matches SPEC.md).
+    Chunk size, framing markers, provider order, landing confirmation.
+    Peer gear handling (still re-inspects on peer inventory changes).
+
+
+KNOWN ISSUE  ::  SITE SIDE, NOT FIXABLE IN THE ADDON
+----------------------------------------------------
+
+    Chronicle's current HermesProxy parser drops all damage and healing
+    lines (the COMBAT_LOG_VERSION line resets its 16 advanced fields to
+    18). Damage and healing show as 0 until that is fixed on the site.
+
+
+============================================================================
+ VERSION 0.8.0  ::  NAMING CLEANUP
+============================================================================
 
 Changed
 - Removed remaining WotLK/Wrath-era naming references from the active addon source and documentation.

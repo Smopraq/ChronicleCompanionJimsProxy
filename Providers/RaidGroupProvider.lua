@@ -56,7 +56,13 @@ end
 -- above 53 bits exactly.
 local function compactGuid(guid)
     local hex = guid and string.match(guid, "^0[xX]([0-9A-Fa-f]+)$")
-    if not hex then return guid end
+    if not hex then
+        -- Classic Era player GUIDs are "Player-<server>-<id>". Chronicle maps
+        -- them to the 64-bit value (server << 32) | id, so write that hex text.
+        local server, id = string.match(guid or "", "^Player%-(%d+)%-(%x+)$")
+        if not server or #id > 8 then return guid end
+        hex = string.format("%X", tonumber(server)) .. string.rep("0", 8 - #id) .. id
+    end
 
     hex = string.gsub(hex, "^0+", "")
     if hex == "" then hex = "0" end

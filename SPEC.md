@@ -30,6 +30,14 @@ slot 1:  [4P0x060...;G1.51396.3820.41398.40014.0.0.0.264:2.50633.0.0.0.0.0.0
 slot 2:  ~.245:5.51398.3832.41398.40051.0.0.0.264:10.50611.3860.0.0.0.0.0.258]
 ```
 
+### GUID-safe chunk boundaries
+
+A chunk boundary never falls inside a GUID written as `<Type>-...`
+(`Player-`, `Pet-`, `Creature-`, `Vehicle-`, `GameObject-`, `Corpse-`).
+Chronicle's HermesProxy parser rewrites those GUIDs on each combat-log line
+before it reassembles the chunks, so a split GUID corrupts the data or aborts
+the parse. The chunk is cut just before the GUID instead.
+
 ### Bin-packing
 
 Short messages can share a single slot:
@@ -122,7 +130,9 @@ Each message is ONE segment for ONE player.
 P<guid>;<segment>
 ```
 
-The `<guid>` is the player's full GUID (e.g. `0x060000000008DCCC`).
+The `<guid>` is the player's full GUID (e.g. `0x060000000008DCCC`). On the
+1.14.2 client this is the native `Player-<server>-<id>` string
+(e.g. `Player-1-00004AAF`).
 The segment is prefixed by a single type character.
 
 #### I -- Identity
@@ -290,7 +300,9 @@ The payload always contains 40 comma-separated GUID fields arranged as eight
 five-player subgroup blocks. Empty subgroup positions are empty fields. Members
 within a subgroup are ordered by their current raid roster index. GUID fields
 contain only hexadecimal digits, omitting both the `0x` prefix and leading
-zeroes. No numeric conversion is used.
+zeroes. No numeric conversion is used. A 1.14.2 `Player-<server>-<id>` GUID
+is written as the hex text of `(server << 32) | id`, the value Chronicle
+assigns that player in the combat log (`Player-1-00004AAF` -> `100004AAF`).
 
 Example (abbreviated):
 ```

@@ -289,21 +289,44 @@ end
 
 local FIELD_MAX = C.FIELD_MAX_CHARS  -- 245
 
---- Compute total chunk count for a payload.
-local function computeChunkCount(payload)
-    local len = #payload
-    -- Single-slot: [N + payload + ] <= 245  ->  payload <= 242
-    if len <= FIELD_MAX - 3 then return 1 end
+-- GUID types written as "<Type>-..." in 1.14.2.  Chronicle's HermesProxy
+-- parser rewrites these GUIDs on each combat-log line before it reassembles
+-- the chunks, so a chunk boundary inside one corrupts or aborts the parse.
+local GUID_PREFIXES = { "Player-", "Pet-", "Creature-", "Vehicle-", "GameObject-", "Corpse-" }
 
-    -- First chunk eats 243 of payload (245 - 2 for "[N")
-    local remaining = len - (FIELD_MAX - 2)
-    -- Continuation chunks have "~" prefix (1 char overhead)
-    -- Last chunk: ~ + payload + ] = 243 payload chars
-    -- Middle chunk: ~ + payload = 244 payload chars
-    if remaining <= FIELD_MAX - 2 then return 2 end  -- first + last
-    remaining = remaining - (FIELD_MAX - 2)  -- subtract last chunk capacity
-    local middles = math.ceil(remaining / (FIELD_MAX - 1))
-    return 1 + middles + 1  -- first + middles + last
+--- Pull a chunk cut back so it does not split a GUID.
+-- @tparam string payload full payload
+-- @tparam number first index of the first payload byte in this chunk
+-- @tparam number cut index of the last payload byte this chunk would hold
+-- @treturn number cut moved before the GUID that spans it, or unchanged
+local function guidSafeCut(payload, first, cut)
+    if cut >= #payload then return cut end
+    if not string.find(payload:sub(cut, cut + 1), "^[%w%-][%w%-]$") then
+        return cut
+    end
+
+    local runStart = cut
+    while runStart > first and string.find(payload:sub(runStart - 1, runStart - 1), "^[%w%-]$") do
+        runStart = runStart - 1
+    end
+    local runEnd = cut + 1
+    while runEnd < #payload and string.find(payload:sub(runEnd + 1, runEnd + 1), "^[%w%-]$") do
+        runEnd = runEnd + 1
+    end
+
+    local run = payload:sub(runStart, runEnd)
+    local guidStart
+    for _, prefix in ipairs(GUID_PREFIXES) do
+        local s = string.find(run, prefix, 1, true)
+        if s then
+            local at = runStart + s - 1
+            if at <= cut and (not guidStart or at < guidStart) then
+                guidStart = at
+            end
+        end
+    end
+    if guidStart then return guidStart - 1 end
+    return cut
 end
 
 --- Build chunk at the given offset for a payload + counter.
@@ -340,10 +363,26 @@ local function buildChunk(payload, counter, offset)
         capacity = capacity - 1
     end
 
-    local slice = payload:sub(offset + 1, offset + capacity)
+    local last = offset + capacity
+    if not isLast then
+        local safe = guidSafeCut(payload, offset + 1, last)
+        if safe > offset then last = safe end
+    end
+    local slice = payload:sub(offset + 1, last)
     local newOffset = offset + #slice
 
     return prefix .. slice .. suffix, newOffset, isLast
+end
+
+--- Compute total chunk count for a payload.
+local function computeChunkCount(payload)
+    local count, offset, isLast = 0, 0, false
+    while not isLast do
+        local _
+        _, offset, isLast = buildChunk(payload, 0, offset)
+        count = count + 1
+    end
+    return count
 end
 
 -- ---------------------------------------------------------------------------
@@ -449,7 +488,7 @@ local function armNext()
                 local counter2 = (activeCounter + 1) % (C.MSG_COUNTER_MAX + 1)
                 -- First chunk prefix: [N (2 chars).  No ] since it continues.
                 local prefix = C.MSG_OPEN .. tostring(counter2)
-                local sliceLen = remainingRoom - #prefix
+                local sliceLen = guidSafeCut(payload2, 1, remainingRoom - #prefix)
                 if sliceLen >= 1 then
                     local slice = payload2:sub(1, sliceLen)
                     chunk = chunk .. prefix .. slice

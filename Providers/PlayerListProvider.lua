@@ -357,6 +357,7 @@ function P:Poll()
                         else
                             seg.dirty = false
                             seg.lastEmitAt = time()
+                            seg.lastSegment = segment
                             local msg = Format.Wrap(pl.guid, segment)
                             local name = UnitName(pl.unit) or pl.guid
                             local summary = string.format("CI %s:%s", name, def.key)
@@ -456,11 +457,26 @@ end
 -- Event wiring
 -- ---------------------------------------------------------------------------
 
+--- Check whether self gear differs from the last emitted gear segment.
+-- UNIT_INVENTORY_CHANGED also fires when equipped items do not change, so an
+-- unchanged scan must not re-send the gear segment before its cooldown.
+-- @treturn boolean true when the gear changed or cannot be compared
+local function selfGearChanged()
+    local pl = players[selfGuid]
+    local seg = pl and pl.segs.G
+    if not seg or not seg.lastSegment then return true end
+    local ok, current = pcall(formatSegment, pl, "G")
+    if not ok or not current then return true end
+    return current ~= seg.lastSegment
+end
+
 -- Self gear changed
 Chronicle.RegisterEvent("UNIT_INVENTORY_CHANGED", function(event, unit)
     if unit == "player" and selfGuid then
-        markSegDirty(selfGuid, "G", "UNIT_INVENTORY_CHANGED")
-        Relay:Kick()
+        if selfGearChanged() then
+            markSegDirty(selfGuid, "G", "UNIT_INVENTORY_CHANGED")
+            Relay:Kick()
+        end
         return
     end
     -- Peer gear changed: invalidate their inspect cache so we re-inspect
@@ -474,7 +490,7 @@ end)
 
 -- Self gear changes, including ring and trinket slots.
 Chronicle.RegisterEvent("PLAYER_EQUIPMENT_CHANGED", function()
-    if selfGuid then
+    if selfGuid and selfGearChanged() then
         markSegDirty(selfGuid, "G", "PLAYER_EQUIPMENT_CHANGED")
         Relay:Kick()
     end
