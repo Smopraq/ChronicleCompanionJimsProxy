@@ -2,7 +2,9 @@
 -- Core/AutoLog.lua
 --
 -- Automatically enables combat logging and activates the relay when the
--- player enters a raid or dungeon instance.  Deactivates when leaving.
+-- player enters a raid or dungeon instance.  After leaving, logging stays on
+-- for LEAVE_TIMEOUT_MIN minutes (ghost release, repair, bank run, summon) and
+-- is turned off only if the player has not entered a raid or dungeon again.
 --
 -- Config toggles:
 --   auto_combatlog_raid    (default true) -- auto-enable LoggingCombat() in raids
@@ -21,11 +23,15 @@ local INSTANCE_TYPES = {
     raid  = true,   -- raids
 }
 
+--- Minutes combat logging stays on after leaving an instance.
+local LEAVE_TIMEOUT_MIN = 30
+
 -- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
 
 local wasInInstance = false   -- track transitions, not just current state
+local leaveTimerId  = 0       -- bumped to cancel a pending leave timeout
 
 -- ---------------------------------------------------------------------------
 -- Evaluate current zone and act
@@ -53,6 +59,7 @@ local function evaluate()
     -- Entering an instance
     if inInstance and not wasInInstance then
         wasInInstance = true
+        leaveTimerId = leaveTimerId + 1   -- cancel any pending leave timeout
 
         -- Auto combat logging (separate toggles for raid vs dungeon)
         local autoLog = false
@@ -78,13 +85,24 @@ local function evaluate()
     -- Leaving an instance
     elseif not inInstance and wasInInstance then
         wasInInstance = false
+        leaveTimerId = leaveTimerId + 1
+        local timerId = leaveTimerId
 
-        -- Turn off combat logging if we auto-enabled it
+        -- Keep combat logging on for a while; turn it off only if the
+        -- player has not entered a raid or dungeon again by then
         if CombatLog:GetState() == true then
-            local result = CombatLog:SetState(false)
-            if result == false then
-                Log:Info("Left instance - combat logging OFF")
-            end
+            Log:Info("Left instance - combat logging stays ON for %d min", LEAVE_TIMEOUT_MIN)
+            C_Timer.After(LEAVE_TIMEOUT_MIN * 60, function()
+                if timerId ~= leaveTimerId then return end
+                if CombatLog:GetState() == true then
+                    local result = CombatLog:SetState(false)
+                    if result == false then
+                        Log:Info("No instance for %d min - combat logging OFF", LEAVE_TIMEOUT_MIN)
+                    end
+                end
+                -- Relay follows combat logging state
+                Relay:Reevaluate()
+            end)
         else
             Log:Info("Left instance")
         end

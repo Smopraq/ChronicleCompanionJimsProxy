@@ -6,6 +6,73 @@
 
 
 ============================================================================
+ VERSION 0.8.2  ::  2026-10-04  ::  AUTO LOG KEEPS LOGGING AFTER LEAVING
+============================================================================
+
+    Leaving a raid or dungeon turned combat logging OFF at once. Releasing
+    as a ghost counts as leaving, so a death cut the log until the player
+    was back inside. Logging now stays on for 30 minutes after leaving.
+
+
+FIXES
+-----
+
+  FIX 01 :: Combat logging stays on for 30 min after leaving an instance
+
+    Covers ghost release, repair, bank runs and summons. Entering a raid
+    or dungeon again within 30 minutes cancels the timeout and logging
+    simply continues. If the player is not back in a raid or dungeon
+    after 30 minutes, logging is turned OFF as before.
+
+    Seen in the field :: 9/27 log, Brainfever released in Onyxia's Lair
+    at 22:16:38; the log was silent 22:17:02 -> 22:20:34, so about
+    3.5 minutes of the Onyxia fight is missing for the whole raid.
+
+
+FILES CHANGED
+-------------
+
+  ┌──────────────────────────────────┬─────────────────────────────────────┐
+  │ FILE                             │ CHANGE                              │
+  ├──────────────────────────────────┼─────────────────────────────────────┤
+  │ Core/AutoLog.lua                 │ 30 min leave timeout (C_Timer)      │
+  │ ChronicleCompanionJimsProxy.toc  │ Version 0.8.1 -> 0.8.2              │
+  │ CHANGELOG.txt                    │ this entry                          │
+  └──────────────────────────────────┴─────────────────────────────────────┘
+
+
+VERIFICATION
+------------
+
+    Run outside the game: the addon's real AutoLog and CombatLogController
+    code under LuaJIT with stubbed WoW APIs and a fake clock.
+
+  ┌──────────────────────────────────────────────┬──────────┬──────────┐
+  │ CASE                                         │ 0.8.1    │ 0.8.2    │
+  ├──────────────────────────────────────────────┼──────────┼──────────┤
+  │ Leave instance -> logging still on           │ no       │ yes      │
+  │ Stay out 30 min -> logging OFF               │ yes      │ yes      │
+  │ Back inside before 30 min -> stays on        │ n/a      │ yes      │
+  │ Leave twice -> only newest timeout counts    │ n/a      │ yes      │
+  │ Manual OFF during timeout -> left alone      │ yes      │ yes      │
+  │ Checks passed (10 total)                     │ 7        │ 10       │
+  └──────────────────────────────────────────────┴──────────┴──────────┘
+
+    Not yet verified in game :: needs one logged session with a death
+    and release, or a walk-out and return.
+
+
+NOT CHANGED
+-----------
+
+    Auto-enable on entering a raid or dungeon (same config toggles).
+    Wire format, relay, providers.
+    A /reload or relog outside an instance during the 30 minutes drops
+    the timeout (it is not saved). If logging is still on after that,
+    it stays on until 30 minutes after the next instance exit.
+
+
+============================================================================
  VERSION 0.8.1  ::  2026-10-03  ::  LOG PARSING FIXES
 ============================================================================
 
